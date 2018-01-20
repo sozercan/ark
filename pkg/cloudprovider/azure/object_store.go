@@ -145,8 +145,6 @@ func (o *objectStore) DeleteObject(bucket string, key string) error {
 	return errors.WithStack(blob.Delete(nil))
 }
 
-const sasURIReadPermission = "r"
-
 func (o *objectStore) CreateSignedURL(bucket, key string, ttl time.Duration) (string, error) {
 	container, err := getContainerReference(o.blobClient, bucket)
 	if err != nil {
@@ -158,7 +156,16 @@ func (o *objectStore) CreateSignedURL(bucket, key string, ttl time.Duration) (st
 		return "", err
 	}
 
-	return blob.GetSASURI(time.Now().Add(ttl), sasURIReadPermission)
+	sasuriOptions := storage.BlobSASOptions{
+		BlobServiceSASPermissions: storage.BlobServiceSASPermissions{
+			Read: true,
+		},
+		SASOptions: storage.SASOptions{
+			Expiry: time.Now().Add(ttl),
+		},
+	}
+
+	return blob.GetSASURI(sasuriOptions)
 }
 
 func getContainerReference(blobClient *storage.BlobStorageClient, bucket string) (*storage.Container, error) {

@@ -23,9 +23,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/arm/disk"
 	"github.com/Azure/azure-sdk-for-go/arm/examples/helpers"
-	"github.com/Azure/azure-sdk-for-go/arm/resources/subscriptions"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2017-03-30/compute"
+	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2016-06-01/subscriptions"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/pkg/errors"
@@ -50,8 +50,8 @@ const (
 )
 
 type blockStore struct {
-	disks         *disk.DisksClient
-	snaps         *disk.SnapshotsClient
+	disks         *compute.DisksClient
+	snaps         *compute.SnapshotsClient
 	subscription  string
 	resourceGroup string
 	location      string
@@ -107,18 +107,19 @@ func (b *blockStore) Init(config map[string]string) error {
 		return errors.Wrap(err, "error creating new service principal token")
 	}
 
-	disksClient := disk.NewDisksClient(cfg[azureSubscriptionIDKey])
-	snapsClient := disk.NewSnapshotsClient(cfg[azureSubscriptionIDKey])
+	disksClient := compute.NewDisksClient(cfg[azureSubscriptionIDKey])
+	snapsClient := compute.NewSnapshotsClient(cfg[azureSubscriptionIDKey])
 
 	authorizer := autorest.NewBearerAuthorizer(spt)
 	disksClient.Authorizer = authorizer
 	snapsClient.Authorizer = authorizer
 
 	// validate the location
-	groupClient := subscriptions.NewGroupClient()
+	groupClient := subscriptions.NewClient()
 	groupClient.Authorizer = authorizer
 
-	locs, err := groupClient.ListLocations(cfg[azureSubscriptionIDKey])
+	ctx := context.Background()
+	locs, err := groupClient.ListLocations(ctx, cfg[azureSubscriptionIDKey])
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -153,25 +154,26 @@ func (b *blockStore) CreateVolumeFromSnapshot(snapshotID, volumeType, volumeAZ s
 	fullSnapshotName := getFullSnapshotName(b.subscription, b.resourceGroup, snapshotID)
 	diskName := "restore-" + uuid.NewV4().String()
 
-	disk := disk.Model{
+	disk := compute.Disk{
 		Name:     &diskName,
 		Location: &b.location,
-		Properties: &disk.Properties{
-			CreationData: &disk.CreationData{
-				CreateOption:     disk.Copy,
+		Sku: &compute.DiskSku{
+			Name: compute.StorageAccountTypes(volumeType),
+		},
+		DiskProperties: &compute.DiskProperties{
+			CreationData: &compute.CreationData{
+				CreateOption:     compute.Copy,
 				SourceResourceID: &fullSnapshotName,
 			},
-			AccountType: disk.StorageAccountTypes(volumeType),
 		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), b.apiTimeout)
 	defer cancel()
 
-	_, errChan := b.disks.CreateOrUpdate(b.resourceGroup, *disk.Name, disk, ctx.Done())
+	future, err := b.disks.CreateOrUpdate(ctx, b.resourceGroup, *disk.Name, disk)
 
-	err := <-errChan
-
+	err = future.WaitForCompletion(ctx, b.disks.Client)
 	if err != nil {
 		return "", errors.WithStack(err)
 	}
@@ -179,16 +181,19 @@ func (b *blockStore) CreateVolumeFromSnapshot(snapshotID, volumeType, volumeAZ s
 }
 
 func (b *blockStore) GetVolumeInfo(volumeID, volumeAZ string) (string, *int64, error) {
-	res, err := b.disks.Get(b.resourceGroup, volumeID)
+	ctx := context.Background()
+
+	res, err := b.disks.Get(ctx, b.resourceGroup, volumeID)
 	if err != nil {
 		return "", nil, errors.WithStack(err)
 	}
 
-	return string(res.AccountType), nil, nil
+	return string(res.Sku.Name), nil, nil
 }
 
 func (b *blockStore) IsVolumeReady(volumeID, volumeAZ string) (ready bool, err error) {
-	res, err := b.disks.Get(b.resourceGroup, volumeID)
+	ctx := context.Background()
+	res, err := b.disks.Get(ctx, b.resourceGroup, volumeID)
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
@@ -212,11 +217,11 @@ func (b *blockStore) CreateSnapshot(volumeID, volumeAZ string, tags map[string]s
 		snapshotName = volumeID[0:80-len(suffix)] + suffix
 	}
 
-	snap := disk.Snapshot{
+	snap := compute.Snapshot{
 		Name: &snapshotName,
-		Properties: &disk.Properties{
-			CreationData: &disk.CreationData{
-				CreateOption:     disk.Copy,
+		DiskProperties: &compute.DiskProperties{
+			CreationData: &compute.CreationData{
+				CreateOption:     compute.Copy,
 				SourceResourceID: &fullDiskName,
 			},
 		},
@@ -232,10 +237,9 @@ func (b *blockStore) CreateSnapshot(volumeID, volumeAZ string, tags map[string]s
 	ctx, cancel := context.WithTimeout(context.Background(), b.apiTimeout)
 	defer cancel()
 
-	_, errChan := b.snaps.CreateOrUpdate(b.resourceGroup, *snap.Name, snap, ctx.Done())
+	future, err := b.snaps.CreateOrUpdate(ctx, b.resourceGroup, *snap.Name, snap)
 
-	err := <-errChan
-
+	err = future.WaitForCompletion(ctx, b.snaps.Client)
 	if err != nil {
 		return "", errors.WithStack(err)
 	}
@@ -247,9 +251,8 @@ func (b *blockStore) DeleteSnapshot(snapshotID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), b.apiTimeout)
 	defer cancel()
 
-	_, errChan := b.snaps.Delete(b.resourceGroup, snapshotID, ctx.Done())
-
-	err := <-errChan
+	future, err := b.snaps.Delete(ctx, b.resourceGroup, snapshotID)
+	err = future.WaitForCompletion(ctx, b.snaps.Client)
 
 	return errors.WithStack(err)
 }
